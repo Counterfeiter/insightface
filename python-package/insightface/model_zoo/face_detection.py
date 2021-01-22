@@ -4,6 +4,9 @@ import numpy as np
 import mxnet.ndarray as nd
 import cv2
 
+import tvm
+from tvm.contrib import utils, graph_runtime
+
 __all__ = [
     'FaceDetector', 'retinaface_r50_v1', 'retinaface_mnet025_v1',
     'retinaface_mnet025_v2', 'get_retinaface'
@@ -204,34 +207,43 @@ def landmark_pred(boxes, landmark_deltas):
 
 
 class FaceDetector:
-    def __init__(self, param_file, rac):
+    def __init__(self, param_file, rac, use_tvm_build=False):
+        self.use_tvm_build = use_tvm_build
         self.param_file = param_file
         self.rac = rac
         self.default_image_size = (480, 640)
 
     def prepare(self, ctx_id, nms=0.4, fix_image_size=None):
-        pos = self.param_file.rfind('-')
-        prefix = self.param_file[0:pos]
-        pos2 = self.param_file.rfind('.')
-        epoch = int(self.param_file[pos + 1:pos2])
-        sym, arg_params, aux_params = mx.model.load_checkpoint(prefix, epoch)
-        if ctx_id >= 0:
-            ctx = mx.gpu(ctx_id)
+
+        if self.use_tvm_build:
+            print("Use TVM RetinaFace Model")
+            loaded_lib = tvm.runtime.load_module(self.param_file)
+            self.model = graph_runtime.GraphModule(loaded_lib["default"](tvm.cpu()))
         else:
-            ctx = mx.cpu()
-        model = mx.mod.Module(symbol=sym, context=ctx, label_names=None)
-        if fix_image_size is not None:
-            data_shape = (1, 3) + fix_image_size
-        else:
-            data_shape = (1, 3) + self.default_image_size
-        model.bind(data_shapes=[('data', data_shape)])
-        model.set_params(arg_params, aux_params)
-        #warmup
-        data = mx.nd.zeros(shape=data_shape)
-        db = mx.io.DataBatch(data=(data, ))
-        model.forward(db, is_train=False)
-        out = model.get_outputs()[0].asnumpy()
-        self.model = model
+            print("Use mxnet RetineFace Model")
+            pos = self.param_file.rfind('-')
+            prefix = self.param_file[0:pos]
+            pos2 = self.param_file.rfind('.')
+            epoch = int(self.param_file[pos+1:pos2])
+            sym, arg_params, aux_params = mx.model.load_checkpoint(prefix, epoch)
+            if ctx_id>=0:
+                ctx = mx.gpu(ctx_id)
+            else:
+                ctx = mx.cpu()
+            model = mx.mod.Module(symbol=sym, context=ctx, label_names = None)
+            if fix_image_size is not None:
+                data_shape = (1,3)+fix_image_size
+            else:
+                data_shape = (1,3)+self.default_image_size
+            model.bind(data_shapes=[('data', data_shape)])
+            model.set_params(arg_params, aux_params)
+            #warmup
+            data = mx.nd.zeros(shape=data_shape)
+            db = mx.io.DataBatch(data=(data,))
+            model.forward(db, is_train=False)
+            out = model.get_outputs()[0].asnumpy()
+            self.model = model
+
         self.nms_threshold = nms
 
         self.landmark_std = 1.0
@@ -326,22 +338,27 @@ class FaceDetector:
         im_tensor = np.zeros((1, 3, im.shape[0], im.shape[1]))
         for i in range(3):
             im_tensor[0, i, :, :] = im[:, :, 2 - i]
-        data = nd.array(im_tensor)
-        db = mx.io.DataBatch(data=(data, ),
-                             provide_data=[('data', data.shape)])
-        self.model.forward(db, is_train=False)
-        net_out = self.model.get_outputs()
-        for _idx, s in enumerate(self._feat_stride_fpn):
-            _key = 'stride%s' % s
+        
+        if self.use_tvm_build:
+            input_data = tvm.nd.array(im_tensor.astype("float32"))
+            self.model.run(data=input_data)
+        else:
+            data = nd.array(im_tensor)
+            db = mx.io.DataBatch(data=(data,), provide_data=[('data', data.shape)])
+            self.model.forward(db, is_train=False)
+            net_out = self.model.get_outputs()
+
+        for _idx,s in enumerate(self._feat_stride_fpn):
+            _key = 'stride%s'%s
             stride = int(s)
             if self.use_landmarks:
                 idx = _idx * 3
             else:
-                idx = _idx * 2
-            scores = net_out[idx].asnumpy()
-            scores = scores[:, self._num_anchors['stride%s' % s]:, :, :]
-            idx += 1
-            bbox_deltas = net_out[idx].asnumpy()
+              idx = _idx*2
+            scores = self.model.get_output(idx).asnumpy() if self.use_tvm_build else net_out[idx].asnumpy()
+            scores = scores[:, self._num_anchors['stride%s'%s]:, :, :]
+            idx+=1
+            bbox_deltas = self.model.get_output(idx).asnumpy() if self.use_tvm_build else net_out[idx].asnumpy()
 
             height, width = bbox_deltas.shape[2], bbox_deltas.shape[3]
             A = self._num_anchors['stride%s' % s]
@@ -378,8 +395,8 @@ class FaceDetector:
             scores_list.append(scores)
 
             if self.use_landmarks:
-                idx += 1
-                landmark_deltas = net_out[idx].asnumpy()
+                idx+=1
+                landmark_deltas = self.model.get_output(idx).asnumpy() if self.use_tvm_build else net_out[idx].asnumpy()
                 landmark_deltas = clip_pad(landmark_deltas, (height, width))
                 landmark_pred_len = landmark_deltas.shape[1] // A
                 landmark_deltas = landmark_deltas.transpose(

@@ -3,6 +3,9 @@ import mxnet as mx
 import numpy as np
 import cv2
 
+import tvm
+from tvm.contrib import utils, graph_runtime
+
 __all__ = [
     'FaceRecognition', 'arcface_r100_v1', 'arcface_outofreach_v1',
     'arcface_mfn_v1', 'get_arcface'
@@ -10,40 +13,43 @@ __all__ = [
 
 
 class FaceRecognition:
-    def __init__(self, name, download, param_file):
-        self.name = name
-        self.download = download
+    def __init__(self, param_file, use_tvm_build=False):
+        self.use_tvm_build = use_tvm_build
         self.param_file = param_file
         self.image_size = (112, 112)
-        if download:
-            assert param_file
 
     def prepare(self, ctx_id):
-        if self.param_file:
-            pos = self.param_file.rfind('-')
-            prefix = self.param_file[0:pos]
-            pos2 = self.param_file.rfind('.')
-            epoch = int(self.param_file[pos + 1:pos2])
-            sym, arg_params, aux_params = mx.model.load_checkpoint(
-                prefix, epoch)
-            all_layers = sym.get_internals()
-            sym = all_layers['fc1_output']
-            if ctx_id >= 0:
-                ctx = mx.gpu(ctx_id)
-            else:
-                ctx = mx.cpu()
-            model = mx.mod.Module(symbol=sym, context=ctx, label_names=None)
-            data_shape = (1, 3) + self.image_size
-            model.bind(data_shapes=[('data', data_shape)])
-            model.set_params(arg_params, aux_params)
-            #warmup
-            data = mx.nd.zeros(shape=data_shape)
-            db = mx.io.DataBatch(data=(data, ))
-            model.forward(db, is_train=False)
-            embedding = model.get_outputs()[0].asnumpy()
-            self.model = model
+        if self.use_tvm_build:
+            print("Use TVM ArcFace Model")
+            loaded_lib = tvm.runtime.load_module(self.param_file)
+            self.model = graph_runtime.GraphModule(loaded_lib["default"](tvm.cpu()))
+
         else:
-            pass
+            if self.param_file:
+                print("Use mxnet ArcFace Model")
+                pos = self.param_file.rfind('-')
+                prefix = self.param_file[0:pos]
+                pos2 = self.param_file.rfind('.')
+                epoch = int(self.param_file[pos+1:pos2])
+                sym, arg_params, aux_params = mx.model.load_checkpoint(prefix, epoch)
+                all_layers = sym.get_internals()
+                sym = all_layers['fc1_output']
+                if ctx_id>=0:
+                    ctx = mx.gpu(ctx_id)
+                else:
+                    ctx = mx.cpu()
+                model = mx.mod.Module(symbol=sym, context=ctx, label_names = None)
+                data_shape = (1,3)+self.image_size
+                model.bind(data_shapes=[('data', data_shape)])
+                model.set_params(arg_params, aux_params)
+                #warmup
+                data = mx.nd.zeros(shape=data_shape)
+                db = mx.io.DataBatch(data=(data,))
+                model.forward(db, is_train=False)
+                embedding = model.get_outputs()[0].asnumpy()
+                self.model = model
+            else:
+                pass
 
     def get_embedding(self, img):
         assert self.param_file and self.model
@@ -51,6 +57,12 @@ class FaceRecognition:
         data = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         data = np.transpose(data, (2, 0, 1))
         data = np.expand_dims(data, axis=0)
+        if self.use_tvm_build:
+            input_data = tvm.nd.array(data.astype("float32"))
+            self.model.run(data=input_data)
+            out = self.model.get_output(0)
+            return out.asnumpy()[0]
+
         data = mx.nd.array(data)
         db = mx.io.DataBatch(data=(data, ))
         self.model.forward(db, is_train=False)
@@ -67,12 +79,13 @@ class FaceRecognition:
 
 def get_arcface(name, download=True, root='~/.insightface/models', **kwargs):
     if not download:
-        return FaceRecognition(name, False, None)
+        from .model_store import get_model_file
+        _file = get_model_file("arcface_%s"%name, root=root)
+        return FaceRecognition(_file)
     else:
         from .model_store import get_model_file
-        _file = get_model_file("arcface_%s" % name, root=root)
-        return FaceRecognition(name, True, _file)
-
+        _file = get_model_file("arcface_%s"%name, root=root)
+        return FaceRecognition(_file)
 
 def arcface_r100_v1(**kwargs):
     return get_arcface("r100_v1", download=True, **kwargs)
